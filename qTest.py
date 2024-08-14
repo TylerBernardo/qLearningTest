@@ -6,6 +6,8 @@ from tf_agents.environments import suite_gym
 from copy import deepcopy
 from numpy import max;
 import imageio
+import matplotlib.pyplot as plt
+
 
 #Create a layer with the given number of nodes
 def dense_layer(num_units):
@@ -29,10 +31,14 @@ class QNetwork:
         q_values_layer = tf.keras.layers.Dense(outputLayer,activation=None,kernel_initializer=tf.keras.initializers.RandomUniform(minval=-0.03, maxval=0.03),bias_initializer=tf.keras.initializers.Constant(-0.2))
         #buid a sequential network based on the layers
         self.q_net = keras.Sequential([inputLayer] + dense_layers + [q_values_layer])
+    #def __init__(self,filePath : str):
+     #   self.q_net = keras.models.load_model(filePath)
     #converts a python list into a tensor in the correct shape, and passes that to the network
     def calc(self, inputs : list[int]) -> tf.Tensor:
         output = self.q_net(tf.reshape(tf.convert_to_tensor(inputs, dtype=tf.float32),shape=(1,len(inputs))));
         return output;
+    def save(self,filename : str) -> None:
+        self.q_net.save("./" + filename + ".keras")
 
 #A class to hold all the experiences
 class ExperienceBuffer:
@@ -53,6 +59,7 @@ class ExperienceBuffer:
     def sample(self,ammount):
         return sample(self.experiences,ammount)
 
+
 #calculate the mean loss for a given set of experiences
 def batchLoss(experiences,network,discount,optimalNetwork):
     #extract the relevant information from the experiences
@@ -65,10 +72,10 @@ def batchLoss(experiences,network,discount,optimalNetwork):
     q_Values = network.q_net(states)
     #make a list of the q values for all actions taken
     experienced_action_values =tf.convert_to_tensor([q_Values[i,actions[i]] for i in range(len(actions))]);
-    #calculate the loss for each experience from the experience list
-    expected_values = rewards + discount * (max(optimalNetwork.q_net(nextStates)) *  (1-finalStates))
-    
-    losses = tf.math.square(expected_values - experienced_action_values)
+    #make a list of the expected q_values for each state, removing the reward of the next state if the current state is a final state
+    expected_values = rewards + discount * (max(optimalNetwork.q_net(nextStates), axis = 1) *  (1-finalStates))
+    #calculate the loss for each experience from the experience list, clamping the error to the interval [-1,1]
+    losses = tf.math.square(tf.clip_by_value(expected_values - experienced_action_values,-1,1))
     #return the squared sum of the losses
     return tf.math.reduce_sum((losses))/len(experiences);
 
@@ -76,7 +83,7 @@ def batchLoss(experiences,network,discount,optimalNetwork):
 def updateWeights(experience,network,discount,optimalNetwork,optimizer):
     meanLoss = 0
     #pull a sample of experience from the buffer
-    experienceToTrain = experience.sample(100)
+    experienceToTrain = experience.sample(128)
     #calculate the loss, tracking the process with a GradientTape
     with tf.GradientTape() as tape:
         meanLoss = batchLoss(experienceToTrain,network,discount,optimalNetwork)
@@ -84,7 +91,41 @@ def updateWeights(experience,network,discount,optimalNetwork,optimizer):
     grads = tape.gradient(meanLoss,network.q_net.trainable_weights)
     #apply the gradients with the given optimizer
     optimizer.apply_gradients(zip(grads, network.q_net.trainable_weights))
-
+    #return the mean loss
+    return meanLoss;
+#Function to evaluate the network using a 100% greedy policy for a given number of episodes
+def evalF(env,maxStepsPerEval,network,num_episodes=5):
+    meanReward = 0;
+    #Go through the correct number of episodes
+    for _ in range(num_episodes):
+        #keep track of variables
+        reward = 0;
+        time_step = env.reset()
+        #add the current frame to the video
+        for s in range(maxStepsPerEval):
+            toAdd = [None] * 4;
+            #Get the current observation from the env
+            toAdd[0] = time_step.observation
+            #Calculate the q_values for this state
+            q_values = network.calc(time_step.observation)
+            #find out which action has a higher q_value
+            if(q_values[0,0] > q_values[0,1]):
+                toAdd[1] = 0;
+            else:
+                toAdd[1] = 1;
+            #take the action
+            time_step = env.step(toAdd[1])
+            #get the reward
+            toAdd[2] = time_step.reward;
+            reward = reward + toAdd[2]
+            #quit if this is the last time step
+            if(time_step.is_last()):
+                break;
+        meanReward += reward/num_episodes; 
+    #print the average reward for debugging
+    print("Eval mean reward: " + str(meanReward));
+    #return the mean rewwad
+    return meanReward
 #run a test of the network only using the greedy policy and save it as a video for manual review
 def makeVideo(env,maxStepsPerEval,network,num_episodes=5,fps=30,filename = "eval.mp4" ):
     meanReward = 0;
@@ -122,20 +163,24 @@ def makeVideo(env,maxStepsPerEval,network,num_episodes=5,fps=30,filename = "eval
             meanReward += reward/num_episodes; 
     #print the average reward for debugging
     print("Eval mean reward: " + str(meanReward));
+    return meanReward
 
 def trainTest(epochs : int, evalsPerEpoch : int, discount : float, learnRate : float, maxStepsPerEval : int, videoInterval : int):
     #training variables
+    losses = []
+    rewards = []
     optimizer = keras.optimizers.Adam(learning_rate=learnRate)
     e = 1;
     decay = .0005;
     minE = 0.01;
     env_name = 'CartPole-v0'
     env = suite_gym.load(env_name)
-    network = QNetwork(4,[100,50],2)
+    network = QNetwork(4,[64],2)#QNetwork("./best.keras")#QNetwork(4,[128,64],2)
     optimalNetwork = deepcopy(network)
     changeOptimal = 50;
     steps = 0
-    experience = ExperienceBuffer(3000)
+    experience = ExperienceBuffer(10000)
+    best = 0;
     #go for a given number of epochs
     for epoch in range(epochs):
         meanReward = 0;
@@ -174,16 +219,17 @@ def trainTest(epochs : int, evalsPerEpoch : int, discount : float, learnRate : f
                 #by default, set the "finished" value to 0(false)
                 toAdd[4] = 0
                 #check if enough experience has been gathered
-                if(steps > 100):
+                if(steps > 128):
                     #update the weights by sampling from the experience
-                    updateWeights(experience,network,discount,optimalNetwork,optimizer)
-                    #change the target network every 100 steps
-                    if((steps-100)%100 == 0):
+                    loss = updateWeights(experience,network,discount,optimalNetwork,optimizer)
+                    #Append the current loss to the list of losses for graphing later
+                    if(steps%20 == 0):
+                        losses.append(loss)
+                    #change the target network every 10000 steps
+                    if((steps)%10000 == 0):
                         optimalNetwork = deepcopy(network)
                 #check if this is the last time step
                 if(time_step.is_last()):
-                    #set the reward to -1 if it is
-                    toAdd[2] = -1;
                     #set "finished" value to 1(true)
                     toAdd[4] = 1;
                     #add the experience to the experience buffer
@@ -195,10 +241,30 @@ def trainTest(epochs : int, evalsPerEpoch : int, discount : float, learnRate : f
             meanReward += episodeReward/evalsPerEpoch
         #if the current epoch is divisible by the videoInterval, save a video of the agent's performance
         if((epoch+1) % videoInterval == 0):
-            makeVideo(env,maxStepsPerEval,network,num_episodes=5,fps=30,filename="eval.mp4")
+            rewards.append(evalF(env,maxStepsPerEval,network,num_episodes=10))
+            #check if this network performed the best so far
+            if(rewards[-1] > best):
+                #save the best network
+                best = rewards[-1]
+                network.save("best")
         #print an update to the console
         print(str(epoch+1) + ")" + "Mean Reward:" + str(meanReward) + " Total steps: " + str(steps))
     #make one final video at the end of evaluation
-    makeVideo(env,maxStepsPerEval,network,num_episodes=5,fps=30,filename="eval.mp4")
+    makeVideo(env,maxStepsPerEval,network,num_episodes=20,fps=30,filename="eval.mp4")
+    #plot the loss versus steps
+    xs = [20*x for x in range(len(losses))]
+    p1 = plt.figure(1)
+    plt.plot(xs, losses)
+    #plot the rewards vs epochs
+    p2 = plt.figure(2)
+    xs2 = [videoInterval * x for x in range(len(rewards))]
+    plt.plot(xs2,rewards)
+    #save the network
+    network.save("final")
+    plt.show()
+    # Make sure to close the plt object once done
+    plt.close()
+    
 
-trainTest(40,30,.618,.05,1000,5)
+
+trainTest(100,20,.9,.0001,1000,5)
